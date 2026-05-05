@@ -23,7 +23,7 @@ output "sns_topic_arn" {
   value       = aws_sns_topic.cost_analysis_notifications.arn
 }
 
-output "eventbridge_rule_name" {
-  description = "Name of the EventBridge rule"
-  value       = aws_cloudwatch_event_rule.ml_cost_analysis_schedule.name
+output "dynamodb_audit_table_name" {
+  description = "Name of the DynamoDB audit trail table"
+  value       = aws_dynamodb_table.audit_trail.name
 }
