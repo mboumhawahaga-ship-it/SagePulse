@@ -123,11 +123,9 @@ resource "aws_lambda_function" "cost_analyzer" {
 
   environment {
     variables = {
-      REPORT_BUCKET       = aws_s3_bucket.cost_reports.id
-      PROJECT_NAME        = var.project_name
-      SNS_TOPIC_ARN       = aws_sns_topic.cost_analysis_notifications.arn
-      AUDIT_TABLE         = aws_dynamodb_table.audit_trail.name
-      COST_THRESHOLD_USD  = tostring(var.cost_threshold_usd)
+      REPORT_BUCKET = aws_s3_bucket.cost_reports.id
+      PROJECT_NAME  = var.project_name
+      SNS_TOPIC_ARN = aws_sns_topic.cost_analysis_notifications.arn
     }
   }
 
@@ -161,9 +159,7 @@ resource "aws_lambda_function" "cost_action" {
 
   environment {
     variables = {
-      PROJECT_NAME   = var.project_name
-      SNS_TOPIC_ARN  = aws_sns_topic.cost_analysis_notifications.arn
-      AUDIT_TABLE    = aws_dynamodb_table.audit_trail.name
+      PROJECT_NAME = var.project_name
     }
   }
 
@@ -177,34 +173,6 @@ resource "aws_lambda_function" "cost_action" {
 resource "aws_cloudwatch_log_group" "lambda_action_logs" {
   name              = "/aws/lambda/${aws_lambda_function.cost_action.function_name}"
   retention_in_days = 7
-
-  tags = {
-    Project   = var.project_name
-    ManagedBy = "Terraform"
-  }
-}
-
-# DynamoDB table pour l'audit trail des actions
-resource "aws_dynamodb_table" "audit_trail" {
-  name         = "${var.project_name}-audit"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "resource"
-  range_key    = "timestamp"
-
-  attribute {
-    name = "resource"
-    type = "S"
-  }
-
-  attribute {
-    name = "timestamp"
-    type = "S"
-  }
-
-  ttl {
-    attribute_name = "ttl"
-    enabled        = true
-  }
 
   tags = {
     Project   = var.project_name

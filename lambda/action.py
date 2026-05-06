@@ -17,35 +17,6 @@ def get_sagemaker_client():
     )
 
 
-def get_dynamodb_table():
-    table_name = os.environ.get("AUDIT_TABLE")
-    if not table_name:
-        return None
-    return boto3.resource(
-        "dynamodb", region_name=os.environ.get("AWS_REGION", "eu-west-1")
-    ).Table(table_name)
-
-
-def write_audit(resource, action, status, detail=None):
-    """Enregistre une action dans la table DynamoDB d'audit."""
-    table = get_dynamodb_table()
-    if not table:
-        return
-    try:
-        now = datetime.now(timezone.utc).isoformat()
-        table.put_item(
-            Item={
-                "resource": resource,
-                "timestamp": now,
-                "action": action,
-                "status": status,
-                "detail": detail or "",
-            }
-        )
-    except ClientError as e:
-        logger.warning(f"⚠️ Audit DynamoDB échoué pour {resource} : {e}")
-
-
 def stop_notebook(notebook_name):
     """
     Arrête un notebook SageMaker (stop uniquement, pas de suppression).
@@ -79,50 +50,33 @@ def stop_notebook(notebook_name):
         }
 
 
-def flag_idle_endpoint(endpoint_name):
+def delete_endpoint(endpoint_name):
     """
-    Signale un endpoint idle via SNS au lieu de le supprimer.
-    La suppression reste une décision humaine — les poids du modèle
-    et la configuration endpoint sont préservés.
+    Supprime un endpoint SageMaker inactif.
+
+    Args:
+        endpoint_name (str): Nom de l'endpoint à supprimer
+
+    Returns:
+        dict: Résultat de l'action avec statut et timestamp
     """
     timestamp = datetime.now(timezone.utc).isoformat()
-    sns_topic_arn = os.environ.get("SNS_TOPIC_ARN")
-    detail = "Endpoint idle depuis 24h — aucune invocation détectée. Action manuelle requise."
     try:
-        if sns_topic_arn:
-            boto3.client(
-                "sns", region_name=os.environ.get("AWS_REGION", "eu-west-1")
-            ).publish(
-                TopicArn=sns_topic_arn,
-                Subject=f"[ML Cost Optimizer] Endpoint idle : {endpoint_name}",
-                Message=(
-                    f"L'endpoint '{endpoint_name}' n'a reçu aucune invocation depuis 24h.\n"
-                    f"Coût estimé : en cours d'accumulation.\n\n"
-                    f"Actions possibles :\n"
-                    f"  - Supprimer manuellement si le modèle n'est plus nécessaire\n"
-                    f"  - Configurer un auto-scaling avec minimum 0 instance\n"
-                    f"  - Conserver si des pics de trafic sont attendus\n\n"
-                    f"Timestamp : {timestamp}"
-                ),
-            )
-        logger.info(
-            f"✅ [{timestamp}] Endpoint idle signalé (non supprimé) : {endpoint_name}"
-        )
-        write_audit(endpoint_name, "flag_idle_endpoint", "notified", detail)
+        get_sagemaker_client().delete_endpoint(EndpointName=endpoint_name)
+        logger.info(f"✅ [{timestamp}] Endpoint supprimé : {endpoint_name}")
         return {
             "resource": endpoint_name,
-            "action": "flag_idle_endpoint",
-            "status": "notified",
+            "action": "delete_endpoint",
+            "status": "success",
             "timestamp": timestamp,
         }
     except ClientError as e:
         logger.error(
-            f"❌ [{timestamp}] Échec notification endpoint {endpoint_name} : {e}"
+            f"❌ [{timestamp}] Échec suppression endpoint {endpoint_name} : {e}"
         )
-        write_audit(endpoint_name, "flag_idle_endpoint", "error", str(e))
         return {
             "resource": endpoint_name,
-            "action": "flag_idle_endpoint",
+            "action": "delete_endpoint",
             "status": "error",
             "error": str(e),
             "timestamp": timestamp,
@@ -166,15 +120,11 @@ def handler(event, context):
 
         results = []
         for name in notebooks:
-            result = stop_notebook(name)
-            write_audit(name, "stop_notebook", result["status"])
-            results.append(result)
+            results.append(stop_notebook(name))
         for name in endpoints:
-            results.append(flag_idle_endpoint(name))
+            results.append(delete_endpoint(name))
 
-        success_count = sum(
-            1 for r in results if r["status"] in ("success", "notified")
-        )
+        success_count = sum(1 for r in results if r["status"] == "success")
         logger.info(f"✅ {success_count}/{len(results)} actions réussies")
 
         return {

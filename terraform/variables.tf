@@ -15,9 +15,3 @@ variable "notification_email" {
   type        = string
   sensitive   = true
 }
-
-variable "cost_threshold_usd" {
-  description = "Notify only if monthly SageMaker cost exceeds this threshold (0 = always notify)"
-  type        = number
-  default     = 0
-}

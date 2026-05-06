@@ -1,6 +1,6 @@
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import boto3
 from aws_lambda_powertools import Logger
@@ -24,6 +24,19 @@ def get_cloudwatch_client():
 
 
 def is_endpoint_idle(endpoint_name, hours=24):
+    """
+    Vérifie si un endpoint est idle via CloudWatch Invocations.
+    Un endpoint est considéré idle s'il n'a reçu aucune requête
+    sur les dernières X heures.
+
+    Args:
+        endpoint_name (str): Nom de l'endpoint
+        hours (int): Fenêtre de temps en heures (défaut 24h)
+
+    Returns:
+        dict: {"is_idle": bool, "total_invocations": int, "hours_checked": int}
+    """
+    from datetime import timedelta
     cw = get_cloudwatch_client()
 
     try:
@@ -48,11 +61,7 @@ def is_endpoint_idle(endpoint_name, hours=24):
             f"{'⚠️' if is_idle else '✅'} {endpoint_name} : "
             f"{total_invocations} invocations sur {hours}h → {'IDLE' if is_idle else 'actif'}"
         )
-        return {
-            "is_idle": is_idle,
-            "total_invocations": total_invocations,
-            "hours_checked": hours,
-        }
+        return {"is_idle": is_idle, "total_invocations": total_invocations, "hours_checked": hours}
 
     except ClientError as e:
         logger.warning(f"⚠️ CloudWatch indisponible pour {endpoint_name} : {e}")
@@ -60,6 +69,20 @@ def is_endpoint_idle(endpoint_name, hours=24):
 
 
 def is_notebook_idle(notebook_name, idle_threshold_pct=5.0, hours=24):
+    """
+    Vérifie si un notebook est idle via CloudWatch CPUUtilization.
+    Un notebook est considéré idle si son CPU moyen est sous le seuil
+    sur les dernières X heures.
+
+    Args:
+        notebook_name (str): Nom du notebook
+        idle_threshold_pct (float): Seuil CPU en % (défaut 5%)
+        hours (int): Fenêtre de temps en heures (défaut 24h)
+
+    Returns:
+        dict: {"is_idle": bool, "avg_cpu": float, "hours_checked": int}
+    """
+    from datetime import timedelta
     cw = get_cloudwatch_client()
 
     try:
@@ -90,54 +113,10 @@ def is_notebook_idle(notebook_name, idle_threshold_pct=5.0, hours=24):
             f"{'⚠️' if is_idle else '✅'} {notebook_name} : "
             f"CPU moyen = {avg_cpu:.1f}% sur {hours}h → {'IDLE' if is_idle else 'actif'}"
         )
-        return {
-            "is_idle": is_idle,
-            "avg_cpu": round(avg_cpu, 1),
-            "hours_checked": hours,
-        }
+        return {"is_idle": is_idle, "avg_cpu": round(avg_cpu, 1), "hours_checked": hours}
 
     except ClientError as e:
         logger.warning(f"⚠️ CloudWatch indisponible pour {notebook_name} : {e}")
-        return {"is_idle": False, "avg_cpu": -1.0, "hours_checked": hours}
-
-
-def is_studio_app_idle(domain_id, user_profile, app_name, hours=24):
-    """
-    Vérifie si une Studio App KernelGateway est idle via CloudWatch.
-    Métrique : KernelGateway/CPUUtilization sur les dernières X heures.
-    """
-    cw = get_cloudwatch_client()
-    try:
-        end_time = datetime.now(timezone.utc)
-        start_time = end_time - timedelta(hours=hours)
-        response = cw.get_metric_statistics(
-            Namespace="AWS/SageMaker",
-            MetricName="CPUUtilization",
-            Dimensions=[
-                {"Name": "DomainId", "Value": domain_id},
-                {"Name": "UserProfileName", "Value": user_profile},
-                {"Name": "AppName", "Value": app_name},
-            ],
-            StartTime=start_time,
-            EndTime=end_time,
-            Period=3600,
-            Statistics=["Average"],
-        )
-        datapoints = response.get("Datapoints", [])
-        if not datapoints:
-            return {"is_idle": True, "avg_cpu": 0.0, "hours_checked": hours}
-        avg_cpu = sum(d["Average"] for d in datapoints) / len(datapoints)
-        is_idle = avg_cpu < 5.0
-        logger.info(
-            f"{'⚠️' if is_idle else '✅'} Studio {app_name} : CPU={avg_cpu:.1f}% → {'IDLE' if is_idle else 'actif'}"
-        )
-        return {
-            "is_idle": is_idle,
-            "avg_cpu": round(avg_cpu, 1),
-            "hours_checked": hours,
-        }
-    except ClientError as e:
-        logger.warning(f"⚠️ CloudWatch indisponible pour Studio app {app_name} : {e}")
         return {"is_idle": False, "avg_cpu": -1.0, "hours_checked": hours}
 
 
@@ -211,37 +190,36 @@ def get_instance_hourly_price(instance_type, region="eu-west-1"):
 
 
 def scan_studio_apps():
+    """
+    Liste toutes les Studio Apps SageMaker actives (successeur des notebooks classiques).
+
+    Returns:
+        list: Liste des Studio Apps avec leur statut et domaine
+    """
     sm = get_sagemaker_client()
     apps = []
+
     try:
         paginator = sm.get_paginator("list_apps")
         for page in paginator.paginate():
             for app in page["Apps"]:
+                # InService = tourne et coûte de l'argent
                 if app["AppType"] in ("JupyterServer", "KernelGateway", "JupyterLab"):
-                    is_running = app["Status"] == "InService"
-                    domain_id = app.get("DomainId", "")
-                    user_profile = app.get("UserProfileName", "")
-                    idle_info = (
-                        is_studio_app_idle(domain_id, user_profile, app["AppName"])
-                        if is_running and app["AppType"] == "KernelGateway"
-                        else {"is_idle": False, "avg_cpu": -1.0, "hours_checked": 24}
-                    )
                     apps.append(
                         {
                             "name": app["AppName"],
                             "type": app["AppType"],
-                            "domain_id": domain_id,
-                            "user_profile": user_profile,
+                            "domain_id": app.get("DomainId", ""),
+                            "user_profile": app.get("UserProfileName", ""),
                             "status": app["Status"],
-                            "is_running": is_running,
-                            "last_modified": str(
-                                app.get("LastHealthCheckTimestamp", "")
-                            ),
-                            **idle_info,
+                            "is_running": app["Status"] == "InService",
+                            "last_modified": str(app.get("LastHealthCheckTimestamp", "")),
                         }
                     )
+
         logger.info(f"✅ {len(apps)} Studio apps trouvées")
         return apps
+
     except ClientError as e:
         logger.error(f"❌ Erreur scan Studio apps : {e}")
         return []
@@ -272,19 +250,13 @@ def scan_notebooks():
                         "instance_type": instance_type,
                         "last_modified": str(nb.get("LastModifiedTime", "")),
                         "is_running": nb["NotebookInstanceStatus"] == "InService",
-                        "carbon_footprint_kg_month": calculate_carbon_footprint(
-                            instance_type
-                        ),
+                        "carbon_footprint_kg_month": calculate_carbon_footprint(instance_type),
                         "hourly_price": hourly_price,
                         "monthly_cost_estimate": round(hourly_price * 730, 2),
                         **(
                             is_notebook_idle(nb["NotebookInstanceName"])
                             if nb["NotebookInstanceStatus"] == "InService"
-                            else {
-                                "is_idle": False,
-                                "avg_cpu": -1.0,
-                                "hours_checked": 24,
-                            }
+                            else {"is_idle": False, "avg_cpu": -1.0, "hours_checked": 24}
                         ),
                     }
                 )
@@ -320,11 +292,7 @@ def scan_endpoints():
                         **(
                             is_endpoint_idle(ep["EndpointName"])
                             if ep["EndpointStatus"] == "InService"
-                            else {
-                                "is_idle": False,
-                                "total_invocations": -1,
-                                "hours_checked": 24,
-                            }
+                            else {"is_idle": False, "total_invocations": -1, "hours_checked": 24}
                         ),
                     }
                 )
@@ -337,62 +305,196 @@ def scan_endpoints():
         return []
 
 
-def scan_training_jobs(stuck_threshold_hours=24):
+def scan_training_jobs():
     """
-    Liste les training jobs complétés ET détecte les jobs bloqués en InProgress
-    depuis plus de stuck_threshold_hours heures.
+    Liste les training jobs récents (30 derniers jours).
+
+    Returns:
+        list: Liste des training jobs
     """
     sm = get_sagemaker_client()
     jobs = []
-    now = datetime.now(timezone.utc)
 
     try:
         paginator = sm.get_paginator("list_training_jobs")
-
         for page in paginator.paginate(StatusEquals="Completed"):
-            for job in page.get("TrainingJobSummaries", []):
+            for job in page["TrainingJobSummaries"]:
                 jobs.append(
                     {
                         "name": job["TrainingJobName"],
                         "status": job["TrainingJobStatus"],
                         "creation_time": str(job.get("CreationTime", "")),
                         "end_time": str(job.get("TrainingEndTime", "")),
-                        "is_stuck": False,
-                        "hours_running": None,
                     }
                 )
 
-        for page in paginator.paginate(StatusEquals="InProgress"):
-            for job in page.get("TrainingJobSummaries", []):
-                creation = job.get("CreationTime")
-                hours_running = None
-                is_stuck = False
-                if creation:
-                    hours_running = round((now - creation).total_seconds() / 3600, 1)
-                    is_stuck = hours_running > stuck_threshold_hours
-                if is_stuck:
-                    logger.warning(
-                        f"⚠️ Training job bloqué : {job['TrainingJobName']} "
-                        f"en InProgress depuis {hours_running}h"
-                    )
-                jobs.append(
-                    {
-                        "name": job["TrainingJobName"],
-                        "status": job["TrainingJobStatus"],
-                        "creation_time": str(creation or ""),
-                        "end_time": None,
-                        "is_stuck": is_stuck,
-                        "hours_running": hours_running,
-                    }
-                )
-
-        stuck_count = sum(1 for j in jobs if j["is_stuck"])
-        logger.info(f"✅ {len(jobs)} training jobs trouvés ({stuck_count} bloqués)")
+        logger.info(f"✅ {len(jobs)} training jobs trouvés")
         return jobs
 
     except ClientError as e:
         logger.error(f"❌ Erreur scan training jobs : {e}")
         return []
+
+
+def check_eu_ai_act_compliance(endpoint_name):
+    """
+    Vérifie la conformité EU AI Act d'un endpoint SageMaker (modèle en production).
+
+    Tags attendus :
+      - ai-risk-level       : high | limited | minimal
+      - human-oversight     : enabled | disabled
+      - model-purpose       : description du cas d'usage (Art. 13)
+      - conformity-assessment : done | pending | not-required (Art. 9)
+
+    Pénalités EU AI Act :
+      - Jusqu'à 35M€ ou 7% CA mondial pour systèmes haut risque non conformes
+      - Jusqu'à 15M€ ou 3% CA pour autres violations
+
+    Returns:
+        dict: Statut conformité EU AI Act et alertes par article
+    """
+    sm = get_sagemaker_client()
+    alerts = []
+
+    try:
+        region = os.environ.get("AWS_REGION", "eu-west-1")
+        arn = f"arn:aws:sagemaker:{region}:{get_account_id()}:endpoint/{endpoint_name}"
+        tags_response = sm.list_tags(ResourceArn=arn)
+        tags = {t["Key"]: t["Value"] for t in tags_response.get("Tags", [])}
+
+        ai_risk = tags.get("ai-risk-level", "unknown")
+
+        # Art. 9 — classification du risque obligatoire
+        if ai_risk == "unknown":
+            alerts.append("[Art. 9] Tag 'ai-risk-level' manquant — risque non classifié")
+
+        # Art. 14 — supervision humaine obligatoire pour les systèmes haut risque
+        if ai_risk == "high" and tags.get("human-oversight") != "enabled":
+            alerts.append("[Art. 14] Modèle haut risque sans human-oversight: enabled — pénalité jusqu'à 35M€")
+
+        # Art. 9 — évaluation de conformité requise pour haut risque
+        if ai_risk == "high" and "conformity-assessment" not in tags:
+            alerts.append("[Art. 9] Tag 'conformity-assessment' manquant sur modèle haut risque")
+
+        # Art. 13 — transparence et documentation du cas d'usage
+        if "model-purpose" not in tags:
+            alerts.append("[Art. 13] Tag 'model-purpose' manquant — cas d'usage non documenté")
+
+        if not alerts:
+            alerts.append("Conforme EU AI Act")
+
+    except ClientError:
+        alerts.append("Impossible de vérifier les tags EU AI Act")
+        ai_risk = "unknown"
+
+    return {
+        "endpoint": endpoint_name,
+        "ai_risk_level": ai_risk,
+        "human_oversight": tags.get("human-oversight", "not-set") if "tags" in dir() else "unknown",
+        "alerts": alerts,
+        "compliant": not alerts or (len(alerts) == 1 and "Conforme" in alerts[0]),
+    }
+
+
+def _build_eu_ai_act_compliance(endpoints):
+    """Évalue la conformité EU AI Act sur tous les endpoints."""
+    if not endpoints:
+        return {"endpoints": [], "global_status": "N/A", "high_risk_count": 0}
+
+    results = [check_eu_ai_act_compliance(e["name"]) for e in endpoints]
+
+    high_risk_non_compliant = [r for r in results if r["ai_risk_level"] == "high" and not r["compliant"]]
+    unknown_risk = [r for r in results if r["ai_risk_level"] == "unknown"]
+
+    if high_risk_non_compliant:
+        global_status = "Non-Compliant"
+    elif unknown_risk:
+        global_status = "Incomplete"
+    else:
+        global_status = "Compliant"
+
+    logger.info(f"✅ EU AI Act scan : {len(results)} endpoints, statut global = {global_status}")
+    return {
+        "endpoints": results,
+        "global_status": global_status,
+        "high_risk_count": len([r for r in results if r["ai_risk_level"] == "high"]),
+    }
+
+
+def check_rgpd_compliance(resource_name, resource_type):
+    """
+    Vérifie la conformité RGPD basique d'une ressource.
+    Retourne les alertes et le niveau de risque.
+
+    Args:
+        resource_name: Nom de la ressource
+        resource_type: Type (notebook, endpoint, training)
+
+    Returns:
+        dict: Statut conformité et alertes
+    """
+    sm = get_sagemaker_client()
+    alerts = []
+    risk_level = "Low"
+
+    try:
+        # Vérifie les tags de la ressource
+        arn = f"arn:aws:sagemaker:{os.environ.get('AWS_REGION', 'eu-west-1')}:{get_account_id()}:{resource_type}/{resource_name}"
+        tags_response = sm.list_tags(ResourceArn=arn)
+        tags = {t["Key"]: t["Value"] for t in tags_response.get("Tags", [])}
+
+        # Vérifie les tags obligatoires RGPD
+        if "owner" not in tags:
+            alerts.append("⚠️ Tag 'owner' manquant → responsable inconnu")
+            risk_level = "Medium"
+
+        if "data-classification" not in tags:
+            alerts.append(
+                "⚠️ Tag 'data-classification' manquant → données non classifiées"
+            )
+            risk_level = "Medium"
+
+        if "expiration-date" not in tags:
+            alerts.append(
+                "⚠️ Tag 'expiration-date' manquant → pas de durée de rétention"
+            )
+            risk_level = "High"
+
+        if not alerts:
+            alerts.append("✅ Tags RGPD conformes")
+
+    except ClientError:
+        alerts.append("⚠️ Impossible de vérifier les tags")
+        risk_level = "Unknown"
+
+    return {
+        "resource": resource_name,
+        "type": resource_type,
+        "rgpd_risk": risk_level,
+        "alerts": alerts,
+    }
+
+
+def _build_rgpd_compliance(notebooks, endpoints):
+    """Calcule la conformité RGPD une seule fois et détermine le risque global."""
+    nb_results = [
+        check_rgpd_compliance(n["name"], "notebook-instance") for n in notebooks
+    ]
+    ep_results = [check_rgpd_compliance(e["name"], "endpoint") for e in endpoints]
+    all_results = nb_results + ep_results
+
+    if any(r["rgpd_risk"] == "High" for r in all_results):
+        global_risk = "High"
+    elif any(r["rgpd_risk"] == "Medium" for r in all_results):
+        global_risk = "Medium"
+    else:
+        global_risk = "Low"
+
+    return {
+        "notebooks": nb_results,
+        "endpoints": ep_results,
+        "global_risk": global_risk,
+    }
 
 
 def calculate_carbon_footprint(instance_type):
@@ -416,6 +518,13 @@ def calculate_carbon_footprint(instance_type):
 
 
 def run_discovery():
+    """
+    Point d'entrée principal : scanne toutes les ressources
+    SageMaker et retourne un rapport complet.
+
+    Returns:
+        dict: Rapport complet avec toutes les ressources
+    """
     logger.info("🔍 Démarrage du scan SageMaker...")
 
     notebooks = scan_notebooks()
@@ -426,12 +535,6 @@ def run_discovery():
     running_notebooks = [n for n in notebooks if n["is_running"]]
     running_studio_apps = [a for a in studio_apps if a["is_running"]]
     running_endpoints = [e for e in endpoints if e["is_running"]]
-    stuck_jobs = [j for j in training_jobs if j.get("is_stuck")]
-    idle_studio_apps = [a for a in studio_apps if a.get("is_idle") and a["is_running"]]
-
-    total_carbon_kg = sum(
-        n.get("carbon_footprint_kg_month", 0) for n in notebooks if n["is_running"]
-    )
 
     rapport = {
         "scan_date": datetime.now(timezone.utc).isoformat(),
@@ -440,25 +543,22 @@ def run_discovery():
             "running_notebooks": len(running_notebooks),
             "total_studio_apps": len(studio_apps),
             "running_studio_apps": len(running_studio_apps),
-            "idle_studio_apps": len(idle_studio_apps),
             "total_endpoints": len(endpoints),
             "running_endpoints": len(running_endpoints),
             "total_training_jobs": len(training_jobs),
-            "stuck_training_jobs": len(stuck_jobs),
-            "total_carbon_kg_month": round(total_carbon_kg, 2),
         },
         "notebooks": notebooks,
         "studio_apps": studio_apps,
         "endpoints": endpoints,
         "training_jobs": training_jobs,
+        "rgpd_compliance": _build_rgpd_compliance(notebooks, endpoints),
+        "eu_ai_act_compliance": _build_eu_ai_act_compliance(endpoints),
     }
 
     logger.info(
         f"📊 Scan terminé : {len(running_notebooks)} notebooks, "
-        f"{len(running_studio_apps)} Studio apps ({len(idle_studio_apps)} idle), "
-        f"{len(running_endpoints)} endpoints, "
-        f"{len(stuck_jobs)} training jobs bloqués, "
-        f"🌱 {total_carbon_kg:.1f} kg CO₂/mois"
+        f"{len(running_studio_apps)} Studio apps, "
+        f"{len(running_endpoints)} endpoints actifs"
     )
     return rapport
 
