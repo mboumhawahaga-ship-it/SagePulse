@@ -2,6 +2,14 @@
 
 ---
 
+## Notebook
+Ton cahier de brouillon interactif pour coder et tester rapidement. Tu écris du code, tu l'exécutes ligne par ligne, tu vois le résultat immédiatement. Problème : il tourne sur une machine AWS payante — si tu oublies de l'éteindre, le compteur tourne.
+
+## Kernel
+Le moteur (la machine AWS) qui fait tourner le notebook. C'est lui qui coûte de l'argent. Un notebook sans kernel actif ne coûte rien. Un kernel qui tourne sans que personne ne l'utilise — c'est exactement ce que SagePulse détecte.
+
+---
+
 ## Handler
 Le responsable de shift au McDonald's. Quand une commande arrive, c'est lui qui reçoit la demande et appelle les bonnes personnes dans le bon ordre. Il ne cuisine pas lui-même — il orchestre.
 
