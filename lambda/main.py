@@ -5,6 +5,7 @@ from datetime import date, datetime, timezone
 import boto3
 from aws_lambda_powertools import Logger
 from botocore.exceptions import ClientError
+from boto3.dynamodb.conditions import Key, Attr
 from discovery import run_discovery
 
 logger = Logger(service="ml-cost-optimizer")
@@ -30,6 +31,82 @@ def get_cloudwatch_client():
     return boto3.client(
         "cloudwatch", region_name=os.environ.get("AWS_REGION", "eu-west-1")
     )
+
+
+def get_dynamodb_table():
+    """Lazy-load DynamoDB table pour l'historique des ressources idle."""
+    table_name = os.environ.get("IDLE_TABLE")
+    if not table_name:
+        return None
+    return boto3.resource(
+        "dynamodb", region_name=os.environ.get("AWS_REGION", "eu-west-1")
+    ).Table(table_name)
+
+
+def save_to_dynamodb(resource_id, resource_type, status, cost, alert_sent):
+    """
+    Enregistre une ressource idle dans DynamoDB.
+
+    Schema :
+      ResourceId  (PK) : identifiant unique de la ressource
+      Timestamp   (SK) : ISO 8601 UTC
+      Type             : notebook | endpoint | studio_app
+      Status           : idle | running
+      Cost             : coût mensuel estimé en $
+      AlertSent        : bool — alerte déjà envoyée
+      ExpiresAt        : TTL Unix timestamp (90 jours)
+    """
+    table = get_dynamodb_table()
+    if not table:
+        logger.warning("⚠️ IDLE_TABLE non configuré — save_to_dynamodb ignoré")
+        return
+    try:
+        now = datetime.now(timezone.utc)
+        ttl = int(now.timestamp()) + 90 * 24 * 3600  # 90 jours
+        table.put_item(Item={
+            "ResourceId": resource_id,
+            "Timestamp": now.isoformat(),
+            "Type": resource_type,
+            "Status": status,
+            "Cost": str(round(cost, 2)),
+            "AlertSent": alert_sent,
+            "ExpiresAt": ttl,
+        })
+        logger.info(f"✅ DynamoDB — {resource_id} ({resource_type}) enregistré")
+    except ClientError as e:
+        logger.warning(f"⚠️ DynamoDB save échoué pour {resource_id} (non-bloquant): {e}")
+
+
+def alert_already_sent(resource_id, within_hours=4):
+    """
+    Vérifie si une alerte a déjà été envoyée pour cette ressource
+    dans les dernières `within_hours` heures.
+    Utilise Query sur ResourceId pour éviter un Scan.
+
+    Returns:
+        bool: True si une alerte récente existe, False sinon
+    """
+    table = get_dynamodb_table()
+    if not table:
+        return False
+    try:
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=within_hours)).isoformat()
+        response = table.query(
+            KeyConditionExpression=(
+                Key("ResourceId").eq(resource_id)
+                & Key("Timestamp").gte(cutoff)
+            ),
+            FilterExpression=Attr("AlertSent").eq(True),
+            Limit=1,
+        )
+        already_sent = len(response.get("Items", [])) > 0
+        if already_sent:
+            logger.info(f"ℹ️ Alerte déjà envoyée pour {resource_id} dans les {within_hours}h — skip")
+        return already_sent
+    except ClientError as e:
+        logger.warning(f"⚠️ DynamoDB query échoué pour {resource_id} (non-bloquant): {e}")
+        return False
 
 
 def publish_metrics(
@@ -671,8 +748,43 @@ def handler(event, context):
                 report_bucket, markdown_content, report_date
             )
 
-            # 3. Send SNS notification (non-blocking - errors caught)
-            if sns_topic_arn:
+            # 3. Log idle resources in DynamoDB + deduplicate SNS alerts
+            idle_notebooks_raw = [
+                n for n in (discovery or {}).get("notebooks", [])
+                if n.get("is_idle") and n.get("is_running")
+            ]
+            idle_endpoints_raw = [
+                e for e in (discovery or {}).get("endpoints", [])
+                if e.get("is_idle") and e.get("is_running")
+            ]
+
+            new_alerts = []
+            for nb in idle_notebooks_raw:
+                already = alert_already_sent(nb["name"])
+                save_to_dynamodb(
+                    resource_id=nb["name"],
+                    resource_type="notebook",
+                    status="idle",
+                    cost=nb.get("monthly_cost_estimate", 0.0),
+                    alert_sent=not already,
+                )
+                if not already:
+                    new_alerts.append(nb["name"])
+
+            for ep in idle_endpoints_raw:
+                already = alert_already_sent(ep["name"])
+                save_to_dynamodb(
+                    resource_id=ep["name"],
+                    resource_type="endpoint",
+                    status="idle",
+                    cost=0.0,
+                    alert_sent=not already,
+                )
+                if not already:
+                    new_alerts.append(ep["name"])
+
+            # 4. Send SNS only if new idle resources (deduplication)
+            if sns_topic_arn and new_alerts:
                 send_sns_notification(
                     sns_topic_arn,
                     total_savings,
@@ -680,31 +792,17 @@ def handler(event, context):
                     len(recs),
                     markdown_url,
                 )
+            elif not sns_topic_arn:
+                logger.warning("⚠️ SNS_TOPIC_ARN not configured, skipping notification")
             else:
-                logger.warning(
-                    "⚠️  Warning: SNS_TOPIC_ARN not configured, skipping notification"
-                )
+                logger.info("ℹ️ Toutes les ressources idle ont déjà été alertées — pas de nouvelle notification")
 
-            # 4. Publish custom CloudWatch metrics
-            idle_notebooks = len(
-                [
-                    n
-                    for n in (discovery or {}).get("notebooks", [])
-                    if n.get("is_idle") and n.get("is_running")
-                ]
-            )
-            idle_endpoints = len(
-                [
-                    e
-                    for e in (discovery or {}).get("endpoints", [])
-                    if e.get("is_idle") and e.get("is_running")
-                ]
-            )
-            publish_metrics(
-                total_savings, idle_notebooks, idle_endpoints, 100.0
-            )
+            # 5. Publish custom CloudWatch metrics
+            idle_notebooks = len(idle_notebooks_raw)
+            idle_endpoints = len(idle_endpoints_raw)
+            publish_metrics(total_savings, idle_notebooks, idle_endpoints, 100.0)
         else:
-            logger.info("⏭️  Skipping S3 uploads and SNS in MOCK_MODE")
+            logger.info("⏭️ Skipping S3 uploads and SNS in MOCK_MODE")
 
         # Return success response
         # Ressources idle à traiter par action.py

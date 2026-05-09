@@ -1,8 +1,10 @@
 import json
 import os
 import sys
+from unittest import mock
 
-# Ajoute le dossier lambda au path pour pouvoir importer main.py
+from botocore.exceptions import ClientError
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lambda"))
 from main import MOCK_DATA, generate_recommendations, handler
 
@@ -145,3 +147,71 @@ class TestHandler:
             assert body["savings_pct"] == 0.0
         finally:
             main.MOCK_DATA = original
+
+
+class TestSaveToDynamoDB:
+    def test_enregistre_ressource_idle(self):
+        import main
+        table = mock.MagicMock()
+        table.put_item.return_value = {}
+        with mock.patch("main.get_dynamodb_table", return_value=table), \
+             mock.patch.dict(os.environ, {"IDLE_TABLE": "test-table"}):
+            main.save_to_dynamodb("nb-1", "notebook", "idle", 36.5, True)
+        table.put_item.assert_called_once()
+        item = table.put_item.call_args[1]["Item"]
+        assert item["ResourceId"] == "nb-1"
+        assert item["Type"] == "notebook"
+        assert item["Status"] == "idle"
+        assert item["AlertSent"] is True
+        assert "ExpiresAt" in item
+
+    def test_ignore_si_table_non_configuree(self):
+        import main
+        with mock.patch("main.get_dynamodb_table", return_value=None):
+            main.save_to_dynamodb("nb-1", "notebook", "idle", 36.5, True)
+
+    def test_erreur_dynamodb_non_bloquante(self):
+        import main
+        from botocore.exceptions import ClientError
+        table = mock.MagicMock()
+        table.put_item.side_effect = ClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": ""}},
+            "PutItem"
+        )
+        with mock.patch("main.get_dynamodb_table", return_value=table):
+            main.save_to_dynamodb("nb-1", "notebook", "idle", 36.5, True)
+
+
+class TestAlertAlreadySent:
+    def test_retourne_true_si_alerte_recente(self):
+        import main
+        table = mock.MagicMock()
+        table.query.return_value = {"Items": [{"ResourceId": "nb-1", "AlertSent": True}]}
+        with mock.patch("main.get_dynamodb_table", return_value=table):
+            result = main.alert_already_sent("nb-1")
+        assert result is True
+
+    def test_retourne_false_si_aucune_alerte(self):
+        import main
+        table = mock.MagicMock()
+        table.query.return_value = {"Items": []}
+        with mock.patch("main.get_dynamodb_table", return_value=table):
+            result = main.alert_already_sent("nb-1")
+        assert result is False
+
+    def test_retourne_false_si_table_non_configuree(self):
+        import main
+        with mock.patch("main.get_dynamodb_table", return_value=None):
+            result = main.alert_already_sent("nb-1")
+        assert result is False
+
+    def test_retourne_false_si_erreur_dynamodb(self):
+        import main
+        from botocore.exceptions import ClientError
+        table = mock.MagicMock()
+        table.query.side_effect = ClientError(
+            {"Error": {"Code": "ResourceNotFoundException", "Message": ""}}, "Query"
+        )
+        with mock.patch("main.get_dynamodb_table", return_value=table):
+            result = main.alert_already_sent("nb-1")
+        assert result is False

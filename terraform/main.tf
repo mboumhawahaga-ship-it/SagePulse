@@ -126,6 +126,7 @@ resource "aws_lambda_function" "cost_analyzer" {
       REPORT_BUCKET = aws_s3_bucket.cost_reports.id
       PROJECT_NAME  = var.project_name
       SNS_TOPIC_ARN = aws_sns_topic.cost_analysis_notifications.arn
+      IDLE_TABLE    = aws_dynamodb_table.idle_resources.name
     }
   }
 
@@ -173,6 +174,34 @@ resource "aws_lambda_function" "cost_action" {
 resource "aws_cloudwatch_log_group" "lambda_action_logs" {
   name              = "/aws/lambda/${aws_lambda_function.cost_action.function_name}"
   retention_in_days = 7
+
+  tags = {
+    Project   = var.project_name
+    ManagedBy = "Terraform"
+  }
+}
+
+# DynamoDB — historique des ressources idle + déduplication alertes
+resource "aws_dynamodb_table" "idle_resources" {
+  name         = "${var.project_name}-idle-resources"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "ResourceId"
+  range_key    = "Timestamp"
+
+  attribute {
+    name = "ResourceId"
+    type = "S"
+  }
+
+  attribute {
+    name = "Timestamp"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "ExpiresAt"
+    enabled        = true
+  }
 
   tags = {
     Project   = var.project_name

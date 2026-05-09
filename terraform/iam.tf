@@ -98,10 +98,10 @@ resource "aws_iam_role_policy" "lambda_sagemaker_policy" {
           "sagemaker:ListNotebookInstances",
           "sagemaker:ListTrainingJobs",
           "sagemaker:ListEndpoints",
+          "sagemaker:ListApps",
           "sagemaker:DescribeNotebookInstance",
           "sagemaker:ListTags",
-          "sagemaker:StopNotebookInstance",
-          "sagemaker:DeleteEndpoint"
+          "sagemaker:StopNotebookInstance"
         ]
         Resource = "*"
       },
@@ -130,6 +130,16 @@ resource "aws_iam_role_policy" "lambda_sagemaker_policy" {
           "pricing:GetProducts"
         ]
         Resource = "*"
+      },
+      {
+        Sid    = "DynamoDBIdleResources"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:PutItem",
+          "dynamodb:GetItem",
+          "dynamodb:Query"
+        ]
+        Resource = aws_dynamodb_table.idle_resources.arn
       },
       {
         Sid    = "S3BucketWriteOnly"
