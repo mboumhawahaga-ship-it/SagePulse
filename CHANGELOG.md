@@ -130,6 +130,7 @@ Pourquoi l'hebdomadaire ne suffit pas : SageMaker facture à l'heure. Un noteboo
 ### Plan v2
 - [ ] Séparer en 3 Lambdas : `cost_scanner` / `cost_calculator` / `cost_action`
 - [x] Passer EventBridge de hebdomadaire à toutes les 4h
+- [ ] Déployer DynamoDB — `terraform apply` pour créer la table `ml-cost-optimizer-idle-resources`
 - [ ] Ajouter alerte SNS immédiate si seuil dépassé (configurable)
 - [x] Ajouter DynamoDB pour l'historique des scans et déduplication alertes
 
